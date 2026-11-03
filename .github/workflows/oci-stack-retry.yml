@@ -1,0 +1,108 @@
+name: oci-stack-retry
+
+# 15 分おきに OCI Resource Manager スタックの適用リトライを試みる。
+# 成功したら Issue + Webhook で通知し、このワークフロー自体を無効化して止まる。
+# 容量不足 (Out of host capacity) の失敗では通知しない (1日100件近くになるため)。
+# 容量不足以外の失敗では Issue を1回だけ作って通知し、自動リトライを止める。
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "容量不足以外の失敗後でも新しい適用を開始する"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  issues: write
+  actions: write
+
+concurrency:
+  group: oci-stack-retry
+  cancel-in-progress: false
+
+jobs:
+  retry:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install OCI CLI
+        run: |
+          bash -c "$(curl -sL https://raw.githubusercontent.com/oracle/oci-cli/master/scripts/install/install.sh)" -- --accept-all-defaults
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Configure OCI CLI
+        env:
+          OCI_CLI_USER: ${{ secrets.OCI_CLI_USER }}
+          OCI_CLI_TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
+          OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
+          OCI_CLI_REGION: ${{ secrets.OCI_CLI_REGION }}
+          OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
+        run: |
+          mkdir -p "$HOME/.oci"
+          printf '%s\n' "$OCI_CLI_KEY_CONTENT" > "$HOME/.oci/oci_api_key.pem"
+          chmod 600 "$HOME/.oci/oci_api_key.pem"
+          cat > "$HOME/.oci/config" <<EOF
+          [DEFAULT]
+          user=$OCI_CLI_USER
+          fingerprint=$OCI_CLI_FINGERPRINT
+          tenancy=$OCI_CLI_TENANCY
+          region=$OCI_CLI_REGION
+          key_file=$HOME/.oci/oci_api_key.pem
+          EOF
+          chmod 600 "$HOME/.oci/config"
+          oci iam region list --output table > /dev/null && echo "OCI config OK"
+
+      - name: Check latest job / start apply
+        id: attempt
+        env:
+          OCI_STACK_ID: ${{ secrets.OCI_STACK_ID }}
+          FORCE: ${{ inputs.force || 'false' }}
+        run: bash scripts/check-and-apply.sh
+
+      - name: Notify success and disable this workflow
+        if: steps.attempt.outputs.status == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WEBHOOK: ${{ secrets.NOTIFY_WEBHOOK_URL }}
+        run: |
+          gh label create oci-retry --color 2da44e --force > /dev/null 2>&1 || true
+          gh issue create \
+            --title "🎉 OCI スタックの適用が成功しました" \
+            --label oci-retry \
+            --body "Resource Manager スタックの適用ジョブが SUCCEEDED になりました (job: ${{ steps.attempt.outputs.job_id }})。OCI コンソールでインスタンスが起動しているか確認してください。このワークフローのスケジュールは自動で無効化されます。" \
+            || true
+          if [ -n "$WEBHOOK" ]; then
+            curl -s -X POST -H 'Content-Type: application/json' \
+              -d '{"content":"🎉 OCI スタックの適用が成功しました！コンソールで確認してください。"}' \
+              "$WEBHOOK" || true
+          fi
+          gh workflow disable oci-stack-retry.yml || true
+
+      - name: Notify fatal (non-capacity) failure once
+        if: steps.attempt.outputs.status == 'fatal'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WEBHOOK: ${{ secrets.NOTIFY_WEBHOOK_URL }}
+        run: |
+          gh label create oci-fatal --color d73a4a --force > /dev/null 2>&1 || true
+          OPEN_COUNT=$(gh issue list --label oci-fatal --state open --json number --jq 'length')
+          if [ "$OPEN_COUNT" = "0" ]; then
+            DETAIL=$(cat fatal_detail.txt 2>/dev/null | tail -c 1000 || echo "(詳細は OCI コンソールのジョブ・ログを確認)")
+            gh issue create \
+              --title "⚠️ OCI スタック適用が容量不足以外の理由で失敗しました" \
+              --label oci-fatal \
+              --body "適用ジョブ (job: ${{ steps.attempt.outputs.job_id }}) が Out of host capacity 以外の理由で失敗したため、自動リトライを停止しています。スタック設定を確認・修正したら、Actions 画面からこのワークフローを手動実行し force を有効にしてください。\n\nログ末尾:\n\`\`\`\n$DETAIL\n\`\`\`" \
+              || true
+            if [ -n "$WEBHOOK" ]; then
+              curl -s -X POST -H 'Content-Type: application/json' \
+                -d '{"content":"⚠️ OCI スタック適用が容量不足以外の理由で失敗し、自動リトライを停止しました。GitHub の Issue を確認してください。"}' \
+                "$WEBHOOK" || true
+            fi
+          fi
