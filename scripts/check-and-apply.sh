@@ -11,6 +11,8 @@
 #   started  … 新しい適用ジョブを開始した
 #   fatal    … 明らかに設定・上限の問題で失敗した。自動リトライを止める
 #              (修正後、ワークフローを手動実行して force=true にすると再開できる)
+#   rate_limited … ジョブ作成が OCI のレート制限 (429) のため見送り。今回の実行は
+#              正常終了とし、次回の実行で再挑戦する (v3 で追加)
 #
 # 失敗理由の判定について (v2 での修正点):
 #   初版は get-job-logs の先頭ページだけを見ていたため、ログ末尾にある
@@ -34,14 +36,33 @@ emit() {
 }
 
 start_apply() {
-  local new_id
-  new_id=$(oci resource-manager job create-apply-job \
-    --stack-id "$STACK_ID" \
-    --execution-plan-strategy AUTO_APPROVED \
-    --query data.id --raw-output)
-  echo "Started new apply job: $new_id"
-  emit status started
-  emit job_id "$new_id"
+  local attempt out new_id
+  for attempt in 1 2 3; do
+    if out=$(oci resource-manager job create-apply-job \
+      --stack-id "$STACK_ID" \
+      --execution-plan-strategy AUTO_APPROVED \
+      --query data.id --raw-output 2>&1); then
+      new_id="$out"
+      echo "Started new apply job: $new_id"
+      emit status started
+      emit job_id "$new_id"
+      return 0
+    fi
+    echo "create-apply-job attempt $attempt failed:"
+    echo "$out"
+    if echo "$out" | grep -qiE "TooManyRequests|status.: 429"; then
+      if [ "$attempt" -lt 3 ]; then
+        echo "Rate limited by OCI (429). Waiting 60s and retrying inside this run..."
+        sleep 60
+        continue
+      fi
+      echo "Still rate limited after all retries. Ending this run quietly; the next run will try again."
+      emit status rate_limited
+      return 0
+    fi
+    # 429 以外のエラーは従来どおり失敗として扱う
+    return 1
+  done
 }
 
 # 最新の APPLY ジョブを取得 (デフォルトで作成日時の降順)
