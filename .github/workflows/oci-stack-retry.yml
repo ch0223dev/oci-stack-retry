@@ -1,13 +1,11 @@
 name: oci-stack-retry
 
-# 15 分おきに OCI Resource Manager スタックの適用リトライを試みる。
+# cron-job.org から 15 分おきに workflow_dispatch で起動され、OCI Resource Manager スタックの適用リトライを試みる。
 # 成功したら Issue + Webhook で通知し、このワークフロー自体を無効化して止まる。
 # 容量不足 (Out of host capacity) の失敗では通知しない (1日100件近くになるため)。
 # 容量不足以外の失敗では Issue を1回だけ作って通知し、自動リトライを止める。
 
 on:
-  schedule:
-    - cron: "7,22,37,52 * * * *"
   workflow_dispatch:
     inputs:
       force:
